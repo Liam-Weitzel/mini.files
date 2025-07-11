@@ -558,6 +558,9 @@
 -- Module definition ==========================================================
 local MiniFiles = {}
 local H = {}
+local fifo_path = ""
+local images = {}
+local preview_col = 0
 
 --- Module setup
 ---
@@ -583,6 +586,41 @@ MiniFiles.setup = function(config)
 
   -- Create default highlighting
   H.create_default_hl()
+
+  -- Generate a random hash using time and random
+  local function generate_random_hash()
+    math.randomseed(os.time() + vim.fn.getpid())
+    local hash = ''
+    for _ = 1, 8 do
+      hash = hash .. string.format("%x", math.random(0, 15))
+    end
+    return hash
+  end
+
+  -- Create random name for FIFO path to support multiple nvim sessions
+  local fifo_name = "nvim_fifo_" .. generate_random_hash()
+  fifo_path = "/tmp/" .. fifo_name
+
+  -- Create fifo
+  if vim.fn.filereadable(fifo_path) == 0 then
+    os.execute("mkfifo " .. fifo_path)
+  end
+
+  -- Start the pipeline: tail -f fifo | ueberzugpp layer -o wayland &
+  local job_id = vim.fn.jobstart(
+    string.format("tail -f %s | ueberzugpp layer -o wayland", fifo_path),
+    {detach = false}
+  )
+
+  vim.api.nvim_create_autocmd("VimLeavePre", {
+    callback = function()
+      if job_id and vim.fn.jobwait({job_id}, 0)[1] == -1 then
+        -- Job is still running, kill it
+        vim.fn.jobstop(job_id)
+      end
+      os.remove(fifo_path)
+    end,
+  })
 end
 
 --stylua: ignore
@@ -869,6 +907,8 @@ end
 ---
 ---@return boolean|nil Whether closing was done or `nil` if there was nothing to close.
 MiniFiles.close = function()
+  H.clear_images()
+
   -- Stop possible tracking lost focus
   pcall(vim.loop.timer_stop, H.timers.focus)
 
@@ -1438,6 +1478,31 @@ H.explorer_is_visible = function(explorer)
   return false
 end
 
+H.clear_images = function()
+  for _, img_path in ipairs(images) do
+    local remove_data = vim.fn.json_encode({
+      action = "remove",
+      path = img_path,
+      identifier = img_path,
+      x = 0,
+      y = 0,
+      max_width = 10, -- how do we map width_preview to this max_width?
+      max_height = 20
+    })
+
+    local fifo = io.open(fifo_path, "w")
+    if fifo then
+      fifo:write(remove_data .. "\n")
+      fifo:flush()
+      fifo:close()
+    else
+      vim.notify("Failed to open FIFO for removing image: " .. fifo_path, vim.log.levels.ERROR)
+    end
+  end
+
+  images = {}
+end
+
 H.explorer_refresh = function(explorer, opts)
   explorer = H.explorer_normalize(explorer)
   if explorer.is_corrupted then
@@ -1452,6 +1517,8 @@ H.explorer_refresh = function(explorer, opts)
   -- Update cursor data in shown views. Do this prior to buffer updates for
   -- cursors to "stick" to current items.
   if not opts.skip_update_cursor then explorer = H.explorer_update_cursors(explorer) end
+
+  H.clear_images()
 
   -- Ensure no outdated views
   for path, view in pairs(explorer.views) do
@@ -1494,14 +1561,15 @@ H.explorer_refresh = function(explorer, opts)
   local depth_range = H.compute_visible_depth_range(explorer, explorer.opts)
 
   -- Refresh window for every target depth keeping track of position column
-  local cur_win_col, cur_win_count = 0, 0
+  local cur_win_col, cur_win_count, cur_width = 0, 0, 0
   for depth = depth_range.from, depth_range.to do
     cur_win_count = cur_win_count + 1
-    local cur_width = H.explorer_refresh_depth_window(explorer, depth, cur_win_count, cur_win_col)
+    cur_width = H.explorer_refresh_depth_window(explorer, depth, cur_win_count, cur_win_col)
 
     -- Add 2 to account for left and right borders
     cur_win_col = cur_win_col + cur_width + 2
   end
+  preview_col = cur_win_col - cur_width - 2
 
   -- Close possibly opened window that don't fit (like after `VimResized`)
   for depth = cur_win_count + 1, #explorer.windows do
@@ -1961,6 +2029,17 @@ H.compute_visible_depth_range = function(explorer, opts)
   return { from = from, to = to }
 end
 
+H.is_image_file = function(path)
+  local ext = path:match("%.([a-zA-Z0-9]+)$")
+  if not ext then return false end
+  local lowered = ext:lower()
+  local image_exts = {
+    jpg = true, jpeg = true, png = true, gif = true,
+    bmp = true, webp = true,
+  }
+  return image_exts[lowered] == true
+end
+
 -- Views ----------------------------------------------------------------------
 H.view_ensure_proper = function(view, path, opts, is_focused, is_preview)
   -- Ensure proper buffer
@@ -1969,7 +2048,7 @@ H.view_ensure_proper = function(view, path, opts, is_focused, is_preview)
     H.buffer_delete(view.buf_id)
     view.buf_id = H.buffer_create(path, opts.mappings)
   end
-  if needs_recreate or needs_reprocess then
+  if needs_recreate or needs_reprocess or H.is_image_file(path) then
     -- Make sure that pressing `u` in new buffer does nothing
     local cache_undolevels = vim.bo[view.buf_id].undolevels
     vim.bo[view.buf_id].undolevels = -1
@@ -2278,28 +2357,70 @@ H.buffer_update_directory = function(buf_id, path, opts, is_preview)
 end
 
 H.buffer_update_file = function(buf_id, path, opts, _)
-  -- Work only with readable text file. This is not 100% proof, but good enough.
-  -- Source: https://github.com/sharkdp/content_inspector
-  local fd, width_preview = vim.loop.fs_open(path, 'r', 1), opts.windows.width_preview
-  if fd == nil then return H.set_buflines(buf_id, { '-No-access' .. string.rep('-', width_preview) }) end
+  local width_preview = opts.windows.width_preview
+
+  -- Check if the path is a FIFO (named pipe)
+  local stat = vim.loop.fs_stat(path)
+  if stat and stat.type == "fifo" then
+    return H.set_buflines(buf_id, { '-FIFO-file' .. string.rep('-', width_preview) })
+  end
+
+  -- Open file descriptor to check if it's a readable text file
+  local fd = vim.loop.fs_open(path, 'r', 1)
+  if fd == nil then
+    return H.set_buflines(buf_id, { '-No-access' .. string.rep('-', width_preview) })
+  end
+
   local is_text = vim.loop.fs_read(fd, 1024):find('\0') == nil
   vim.loop.fs_close(fd)
-  if not is_text then return H.set_buflines(buf_id, { '-Non-text-file' .. string.rep('-', width_preview) }) end
 
-  -- Compute lines. Limit number of read lines to work better on large files.
+  if not is_text then
+    if H.is_image_file(path) then
+      local json_data = vim.fn.json_encode({
+        action = "add",
+        path = path,
+        identifier = path,
+        x = preview_col+1,
+        y = 1,
+        max_width = width_preview-2,
+        max_height = 18
+      })
+
+      table.insert(images, path)
+
+      local fifo = io.open(fifo_path, "w")
+      if fifo then
+        fifo:write(json_data .. "\n")
+        fifo:flush()
+        fifo:close()
+      else
+        vim.notify("Failed to open FIFO for writing: " .. fifo_path, vim.log.levels.ERROR)
+      end
+
+      local num_lines = 20
+      local blank_line = string.rep(' ', width_preview)
+      local lines = {}
+
+      for _ = 1, num_lines do
+        table.insert(lines, blank_line)
+      end
+
+      return H.set_buflines(buf_id, lines)
+    end
+
+    return H.set_buflines(buf_id, { '-Non-text-file' .. string.rep('-', width_preview) })
+  end
+
+  -- Read and set file lines (text file)
   local has_lines, read_res = pcall(vim.fn.readfile, path, '', vim.o.lines)
-  -- - Make sure that lines don't contain '\n' (might happen in binary files).
   local lines = has_lines and vim.split(table.concat(read_res, '\n'), '\n') or {}
-
-  -- Set lines
   H.set_buflines(buf_id, lines)
 
-  -- Add highlighting if reasonable (for performance or functionality reasons)
+  -- Optional syntax/tree-sitter highlighting
   if H.buffer_should_highlight(buf_id) then
     local ft = vim.filetype.match({ buf = buf_id, filename = path })
     local has_lang, lang = pcall(vim.treesitter.language.get_lang, ft)
     lang = has_lang and lang or ft
-    -- TODO: Remove `opts.error` after compatibility with Neovim=0.11 is dropped
     local has_parser, parser = pcall(vim.treesitter.get_parser, buf_id, lang, { error = false })
     has_parser = has_parser and parser ~= nil
     if has_parser then has_parser = pcall(vim.treesitter.start, buf_id, lang) end
