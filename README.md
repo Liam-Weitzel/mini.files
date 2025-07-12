@@ -1,3 +1,13 @@
+# Fork which adds image previews
+
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/5693219b-2cbb-4b58-bd78-04f0a0b6adac" />
+
+Needs [ueberzugpp](https://github.com/jstkdng/ueberzugpp) installed. Tested & developed on nixos + sway + alacritty. Should work with any terminal.
+
+No PR @echasnovski wants to keep mini.files as a 0 dependancy package as suggested by [this comment](https://github.com/echasnovski/mini.nvim/issues/1423).
+
+---
+
 <img src="https://github.com/echasnovski/media/blob/main/mini.nvim/logo/logo_files.png" style="width: 100%">
 
 <!-- badges: start -->
