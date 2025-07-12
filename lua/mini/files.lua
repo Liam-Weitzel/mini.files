@@ -2034,8 +2034,11 @@ H.is_image_file = function(path)
   if not ext then return false end
   local lowered = ext:lower()
   local image_exts = {
-    jpg = true, jpeg = true, png = true, gif = true,
-    bmp = true, webp = true,
+    jpg = true,
+    jpeg = true,
+    png = true,
+    bmp = true,
+    webp = true
   }
   return image_exts[lowered] == true
 end
