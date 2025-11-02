@@ -145,6 +145,9 @@ MiniFiles.close = function()
 
   if not H.explorer_ignore_pending_fs_actions(explorer, 'Close') then return false end
 
+  -- Clear any active image preview
+  H.clear_image_preview()
+
   H.trigger_event('MiniFilesExplorerClose')
 
   explorer = H.explorer_ensure_target_window(explorer)
@@ -535,6 +538,13 @@ H.explorer_refresh = function(explorer, opts)
   if #explorer.branch == 0 then return end
   opts = opts or {}
 
+  -- Clear image preview if we're no longer in preview mode
+  local preview_depth = explorer.depth_focus + 1
+  local has_preview = explorer.opts.windows.preview and preview_depth <= #explorer.branch
+  if not has_preview and H.current_image_preview then
+    H.clear_image_preview()
+  end
+
   if not opts.skip_update_cursor then explorer = H.explorer_update_cursors(explorer) end
 
   for path, view in pairs(explorer.views) do
@@ -593,6 +603,10 @@ H.explorer_track_lost_focus = function()
   local track = vim.schedule_wrap(function()
     local ft = vim.bo.filetype
     if ft == 'minifiles' or ft == 'minifiles-help' then return end
+
+    -- Don't close if we have an active image preview to prevent interrupting image viewing
+    if H.current_image_preview then return end
+
     local cur_win_id = vim.api.nvim_get_current_win()
     MiniFiles.close()
     pcall(vim.api.nvim_set_current_win, cur_win_id)
@@ -986,15 +1000,20 @@ end
 
 H.view_ensure_proper = function(view, path, opts, is_focused, is_preview)
   local needs_recreate, needs_reprocess = not H.is_valid_buf(view.buf_id), not view.was_focused and is_focused
+
+  -- Force update for image files in preview mode to ensure image preview is triggered
+  local needs_image_update = is_preview and H.is_image_file(path)
+
   if needs_recreate then
     H.buffer_delete(view.buf_id)
     view.buf_id = H.buffer_create(path, opts.mappings)
   end
-  if needs_recreate or needs_reprocess then
+  if needs_recreate or needs_reprocess or needs_image_update then
     local cache_undolevels = vim.bo[view.buf_id].undolevels
     vim.bo[view.buf_id].undolevels = -1
     H.buffer_update(view.buf_id, path, opts, is_preview)
     vim.bo[view.buf_id].undolevels = cache_undolevels
+  else
   end
   view.was_focused = view.was_focused or is_focused
 
@@ -1200,7 +1219,9 @@ H.buffer_make_mappings = function(buf_id, mappings)
 end
 
 H.buffer_update = function(buf_id, path, opts, is_preview)
-  if not H.is_valid_buf(buf_id) then return end
+  if not H.is_valid_buf(buf_id) then
+    return
+  end
 
   local fs_type = H.fs_get_type(path)
   if fs_type == 'directory' then H.buffer_update_directory(buf_id, path, opts, is_preview) end
@@ -1255,9 +1276,30 @@ H.buffer_update_directory = function(buf_id, path, opts, is_preview)
   end
 end
 
-H.buffer_update_file = function(buf_id, path, opts, _)
+H.buffer_update_file = function(buf_id, path, opts, is_preview)
   local fd, width_preview = vim.loop.fs_open(path, 'r', 1), opts.windows.width_preview
   if fd == nil then return H.set_buflines(buf_id, { '-No-access' .. string.rep('-', width_preview) }) end
+
+  -- Check if this is an image file and we're in preview mode
+  if is_preview and H.is_image_file(path) then
+    vim.loop.fs_close(fd)
+    -- For image files, set placeholder content and defer actual rendering
+    -- The image will be rendered after the window is properly set up
+    local empty_lines = {}
+    for i = 1, 15 do
+      table.insert(empty_lines, '')
+    end
+    -- Use direct API call to avoid vim.inspect issues with newlines
+    vim.api.nvim_buf_set_lines(buf_id, 0, -1, false, empty_lines)
+
+    -- Mark this buffer for image preview
+    if not H.opened_buffers[buf_id] then
+      H.opened_buffers[buf_id] = { path = path }
+    end
+    H.opened_buffers[buf_id].pending_image_preview = path
+    return
+  end
+
   local is_text = vim.loop.fs_read(fd, 1024):find('\0') == nil
   vim.loop.fs_close(fd)
   if not is_text then return H.set_buflines(buf_id, { '-Non-text-file' .. string.rep('-', width_preview) }) end
@@ -1431,6 +1473,23 @@ H.window_set_view = function(win_id, view)
   if culopt:find('line') == nil then vim.wo[win_id].cursorlineopt = culopt .. ',line' end
 
   H.window_update_border_hl(win_id)
+
+  -- Check for pending image preview and render it now that window is ready
+  if buf_data.pending_image_preview then
+    local image_path = buf_data.pending_image_preview
+    buf_data.pending_image_preview = nil
+    vim.schedule(function()
+      if H.is_valid_win(win_id) and H.is_valid_buf(buf_id) then
+        -- Check if this is still the current buffer data for this path
+        -- Skip if buffer has been reassigned to a different path
+        if H.opened_buffers[buf_id] and H.opened_buffers[buf_id].path == image_path then
+          pcall(H.show_image_preview, buf_id, image_path, win_id)
+        else
+        end
+      else
+      end
+    end)
+  end
 end
 
 H.window_set_cursor = function(win_id, cursor)
@@ -1806,5 +1865,173 @@ end
 H.sanitize_string = function(x) return ((x or ''):gsub('\n', '<NL>'):gsub('%z', '')) end
 
 H.islist = vim.fn.has('nvim-0.10') == 1 and vim.islist or vim.tbl_islist
+
+-- Image preview functionality
+H.image_extensions = { 'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tiff', 'tif', 'webp', 'svg', 'ico' }
+H.current_image_preview = nil
+H.image_cleanup_scheduled = {}
+
+H.is_image_file = function(path)
+  if not path then return false end
+  local ext = path:match('%.([^.]+)$')
+  if not ext then return false end
+  ext = ext:lower()
+  for _, img_ext in ipairs(H.image_extensions) do
+    if ext == img_ext then return true end
+  end
+  return false
+end
+
+H.cleanup_temp_image_file = function(temp_file)
+  if not temp_file then return end
+  vim.defer_fn(function()
+    pcall(function()
+      vim.fn.delete(temp_file)
+      local temp_dir = vim.fn.fnamemodify(temp_file, ':h')
+      vim.fn.delete(temp_dir, 'd')
+    end)
+  end, 2000) -- 2000ms delay to ensure image.nvim has fully cleared references
+end
+
+H.clear_image_preview = function()
+  if H.current_image_preview then
+    pcall(function()
+      if H.current_image_preview.image then
+        H.current_image_preview.image:clear()
+      end
+      -- Clean up temporary file
+      if H.current_image_preview.temp_file then
+        H.cleanup_temp_image_file(H.current_image_preview.temp_file)
+      end
+    end)
+    H.current_image_preview = nil
+  end
+
+  -- Also clear any lingering images from image.nvim's internal registry
+  -- to prevent errors when temp files are deleted
+  pcall(function()
+    local has_image, image = pcall(require, 'image')
+    if has_image then
+      -- Use global clear to remove all images from image.nvim
+      pcall(function() image.clear() end)
+
+      -- Also clear individual images as backup
+      local all_images = image.get_images() or {}
+      for _, img in ipairs(all_images) do
+        pcall(function() img:clear() end)
+      end
+    end
+  end)
+end
+
+H.create_temp_resized_image = function(path, target_width, target_height)
+  local temp_dir = vim.fn.tempname()
+  vim.fn.mkdir(temp_dir, 'p')
+  local temp_file = temp_dir .. '/' .. vim.fn.fnamemodify(path, ':t:r') .. '_resized.' .. vim.fn.fnamemodify(path, ':e')
+
+  -- For GIFs, extract only the first frame to avoid animation issues
+  local is_gif = vim.fn.fnamemodify(path, ':e'):lower() == 'gif'
+  local source_path = is_gif and (path .. '[0]') or path
+
+  local cmd = string.format(
+    'convert "%s" -resize %dx%d\\> "%s"',
+    source_path, target_width, target_height, temp_file
+  )
+
+  local result = vim.fn.system(cmd)
+  if vim.v.shell_error ~= 0 then
+    return nil, 'ImageMagick convert failed: ' .. result
+  end
+
+  return temp_file
+end
+
+H.show_image_preview = function(buf_id, path, win_id)
+
+  -- Only clear if we're showing a different image path
+  -- (Don't clear for same image, even if buffer ID is different)
+  local current_path = H.current_image_preview and H.opened_buffers[H.current_image_preview.buffer] and H.opened_buffers[H.current_image_preview.buffer].path
+  if H.current_image_preview and current_path ~= path then
+    H.clear_image_preview()
+  end
+
+  -- Validate inputs
+  if not H.is_valid_buf(buf_id) or not H.is_valid_win(win_id) then
+    return
+  end
+
+  -- Check if image.nvim is available
+  local has_image, image = pcall(require, 'image')
+  if not has_image then
+    pcall(H.set_buflines, buf_id, { '-Image preview requires image.nvim plugin-' })
+    return
+  end
+
+  -- Set buffer content to exactly 15 lines for consistent height
+  local empty_lines = {}
+  for i = 1, 15 do
+    table.insert(empty_lines, '')
+  end
+  vim.api.nvim_buf_set_lines(buf_id, 0, -1, false, empty_lines)
+
+  -- Set window height to exactly 15 lines
+  if H.is_valid_win(win_id) then
+    vim.api.nvim_win_set_height(win_id, 15)
+  end
+
+  -- Calculate dimensions for 15 lines height
+  local cell_width = 10  -- approximate character width in pixels
+  local cell_height = 20 -- approximate character height in pixels
+  local target_height = 15 * cell_height
+  local target_width = vim.api.nvim_win_get_width(win_id) * cell_width
+
+  -- Create resized temporary image
+  local temp_file, err = H.create_temp_resized_image(path, target_width, target_height)
+  if not temp_file then
+    pcall(H.set_buflines, buf_id, { '-Image resize failed: ' .. (err or 'unknown error') .. '-' })
+    return
+  end
+
+  -- Verify temp file still exists before creating image
+  if vim.fn.filereadable(temp_file) ~= 1 then
+    pcall(H.set_buflines, buf_id, { '-Image file no longer available-' })
+    return
+  end
+
+  -- Create and render image
+  local ok_img, img = pcall(image.from_file, temp_file, {
+    buffer = buf_id,
+    window = win_id,
+    x = 0,
+    y = 0,
+    width = target_width,
+    height = target_height,
+  })
+
+  if ok_img and img then
+    -- Double-check file still exists before rendering
+    if vim.fn.filereadable(temp_file) == 1 then
+      local ok_render = pcall(function() img:render() end)
+      if ok_render then
+        H.current_image_preview = {
+          image = img,
+          temp_file = temp_file,
+          buffer = buf_id,
+          window = win_id
+        }
+      else
+        pcall(function() img:clear() end)
+        pcall(H.set_buflines, buf_id, { '-Failed to render image-' })
+        H.cleanup_temp_image_file(temp_file)
+      end
+    else
+      pcall(function() img:clear() end)
+      pcall(H.set_buflines, buf_id, { '-Image file was deleted during preview-' })
+    end
+  else
+    pcall(H.set_buflines, buf_id, { '-Failed to create image preview-' })
+    H.cleanup_temp_image_file(temp_file)
+  end
+end
 
 return MiniFiles
