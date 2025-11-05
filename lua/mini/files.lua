@@ -43,6 +43,10 @@ MiniFiles.config = {
     synchronize = '=',
     trim_left   = '<',
     trim_right  = '>',
+    copy_relative_path = 'ypr',
+    copy_absolute_path = 'ypa',
+    open_with_default = 'gx',
+    open_in_explorer = 'gX',
   },
 
   options = {
@@ -250,6 +254,45 @@ MiniFiles.show_help = function()
   H.explorer_show_help(explorer, buf_id, vim.api.nvim_get_current_win())
 end
 
+MiniFiles.copy_relative_path = function()
+  local fs_entry = MiniFiles.get_fs_entry()
+  if fs_entry == nil then return end
+
+  local cwd = vim.fn.getcwd()
+  local relative_path = vim.fn.fnamemodify(fs_entry.path, ':~:.')
+  vim.fn.setreg('+', relative_path)
+  vim.fn.setreg('"', relative_path)
+  H.notify('Copied relative path: ' .. relative_path)
+end
+
+MiniFiles.copy_absolute_path = function()
+  local fs_entry = MiniFiles.get_fs_entry()
+  if fs_entry == nil then return end
+
+  local absolute_path = vim.fn.fnamemodify(fs_entry.path, ':p')
+  vim.fn.setreg('+', absolute_path)
+  vim.fn.setreg('"', absolute_path)
+  H.notify('Copied absolute path: ' .. absolute_path)
+end
+
+MiniFiles.open_with_default = function()
+  local fs_entry = MiniFiles.get_fs_entry()
+  if fs_entry == nil then return end
+
+  local cmd = string.format('xdg-open %s >/dev/null 2>&1 &', vim.fn.shellescape(fs_entry.path))
+  vim.fn.system(cmd)
+end
+
+MiniFiles.open_in_explorer = function()
+  local fs_entry = MiniFiles.get_fs_entry()
+  if fs_entry == nil then return end
+
+  local path = fs_entry.fs_type == 'directory' and fs_entry.path or vim.fn.fnamemodify(fs_entry.path, ':h')
+  local cmd = string.format('xdg-open %s', vim.fn.shellescape(path))
+  vim.fn.system(cmd)
+  H.notify('Opened in file explorer: ' .. path)
+end
+
 MiniFiles.get_fs_entry = function(buf_id, line)
   buf_id = H.validate_opened_buffer(buf_id)
   line = H.validate_line(buf_id, line)
@@ -414,6 +457,10 @@ H.setup_config = function(config)
   H.check_type('mappings.synchronize', config.mappings.synchronize, 'string')
   H.check_type('mappings.trim_left', config.mappings.trim_left, 'string')
   H.check_type('mappings.trim_right', config.mappings.trim_right, 'string')
+  H.check_type('mappings.copy_relative_path', config.mappings.copy_relative_path, 'string')
+  H.check_type('mappings.copy_absolute_path', config.mappings.copy_absolute_path, 'string')
+  H.check_type('mappings.open_with_default', config.mappings.open_with_default, 'string')
+  H.check_type('mappings.open_in_explorer', config.mappings.open_in_explorer, 'string')
 
   H.check_type('options', config.options, 'table')
   H.check_type('options.use_as_default_explorer', config.options.use_as_default_explorer, 'boolean')
@@ -1214,6 +1261,10 @@ H.buffer_make_mappings = function(buf_id, mappings)
   buf_map('n', mappings.synchronize, MiniFiles.synchronize, 'Synchronize')
   buf_map('n', mappings.trim_left,   MiniFiles.trim_left,   'Trim branch left')
   buf_map('n', mappings.trim_right,  MiniFiles.trim_right,  'Trim branch right')
+  buf_map('n', mappings.copy_relative_path, MiniFiles.copy_relative_path, 'Copy relative path')
+  buf_map('n', mappings.copy_absolute_path, MiniFiles.copy_absolute_path, 'Copy absolute path')
+  buf_map('n', mappings.open_with_default, MiniFiles.open_with_default, 'Open with default app')
+  buf_map('n', mappings.open_in_explorer, MiniFiles.open_in_explorer, 'Open in file explorer')
 
   H.map('x', mappings.go_in, go_in_visual, { buffer = buf_id, desc = 'Go in selected entries', expr = true })
 end
@@ -1565,6 +1616,7 @@ H.get_fs_entry_from_path_index = function(path_id)
   if path == nil then return nil end
   return { fs_type = H.fs_get_type(path), name = H.fs_get_basename(path), path = path }
 end
+
 
 H.replace_path_in_index = function(from, to)
   local from_id, to_id = H.path_index[from], H.path_index[to]
